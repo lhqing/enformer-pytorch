@@ -20,6 +20,8 @@ class EnformerConfig(PretrainedConfig):
         # genetic sequence is downsampled 2 ** 7 == 128x in default Enformer - can be changed for higher resolution
         # input is 2 ** 17 == 131072 bp
         dim_divisible_by = 128,
+        # Have to set this to true if using the pretrained weights
+        # See discussion here: https://github.com/lucidrains/enformer-pytorch/issues/31
         use_tf_gamma = False,
         **kwargs,
     ):

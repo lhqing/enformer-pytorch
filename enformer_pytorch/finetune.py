@@ -198,6 +198,8 @@ class HeadAdapterWrapper(nn.Module):
         if not exists(target):
             return preds
 
+        # TODO: poisson_loss is for count tracks
+        # for mC fraction tracks (0-1), we need to use binary cross entropy
         return poisson_loss(preds, target)
 
 
@@ -392,9 +394,13 @@ class ContextAttentionAdapterWrapper(nn.Module):
         if context.ndim == 2:
             context = rearrange(context, "b d -> b 1 d")
 
+        # convert enformer embedding dims to inner_dim
+        # inner_dim = heads * dim_head
         q = self.to_queries(self.query_norm(embeddings))
+        # convert context dims to inner_dim * 2, since we're splitting into key and value
         k, v = self.to_key_values(self.key_values_norm(context)).chunk(2, dim=-1)
 
+        # TODO: what does this null_k and null_v do here?
         null_k, null_v = map(
             lambda t: repeat(t, "d -> b 1 d", b=context.shape[0]),
             (self.null_key, self.null_value),

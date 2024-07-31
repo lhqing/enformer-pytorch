@@ -6,7 +6,7 @@ from torch import nn, einsum
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint_sequential
-
+from typing import Union, Optional
 from einops import rearrange, reduce
 from einops.layers.torch import Rearrange
 
@@ -17,7 +17,6 @@ from enformer_pytorch.config_enformer import EnformerConfig
 from transformers import PreTrainedModel
 
 # constants
-
 SEQUENCE_LENGTH = 196_608
 TARGET_LENGTH = 896
 
@@ -210,6 +209,16 @@ class GELU(nn.Module):
 
 
 class AttentionPool(nn.Module):
+    """
+    This class implements the attention pooling mechanism for the Enformer model.
+
+    Reduce the sequence length by a factor of pool_size using attention pooling.
+
+    Here is the original pooling in Enformer repo:
+    https://github.com/google-deepmind/deepmind-research/blob/master/enformer/enformer.py#L236C5-L237C46
+
+    It uses the SoftmaxPooling1D for AttentionPool
+    """
     def __init__(self, dim, pool_size=2):
         super().__init__()
         self.pool_size = pool_size
@@ -217,12 +226,20 @@ class AttentionPool(nn.Module):
 
         self.to_attn_logits = nn.Conv2d(dim, dim, 1, bias=False)
 
+        # close to identiy init
         nn.init.dirac_(self.to_attn_logits.weight)
 
+        # TODO: I'm not sure why this is necessary? Aim to keep the value scale the same after pool?
         with torch.no_grad():
             self.to_attn_logits.weight.mul_(2)
 
     def forward(self, x):
+        """
+        x: torch.Tensor, shape (batch, dim, seq_len)
+
+        Returns:
+        - torch.Tensor, shape (batch, dim, seq_len)
+        """
         b, _, n = x.shape
         remainder = n % self.pool_size
         needs_padding = remainder > 0
@@ -245,11 +262,17 @@ class AttentionPool(nn.Module):
 
 
 class TargetLengthCrop(nn.Module):
+    """
+    This class simply crops the input into the target length symmetrically at seq_length dimension.
+    """
     def __init__(self, target_length):
         super().__init__()
         self.target_length = target_length
 
     def forward(self, x):
+        """
+        x: torch.Tensor, shape (batch, seq_len, dim)
+        """
         seq_len, target_len = x.shape[-2], self.target_length
 
         if target_len == -1:
@@ -387,7 +410,8 @@ class Enformer(PreTrainedModel):
         )
 
         # create conv tower
-
+        # exponential_linspace_int(768, 1536, 7-1, 128)
+        # [768, 896, 1024, 1152, 1280, 1536]
         filter_list = exponential_linspace_int(
             half_dim,
             config.dim,
@@ -395,6 +419,7 @@ class Enformer(PreTrainedModel):
             divisible_by=config.dim_divisible_by,
         )
         filter_list = [half_dim, *filter_list]
+        # final filter list is [768, 768, 896, 1024, 1152, 1280, 1536]
 
         conv_layers = []
         for dim_in, dim_out in zip(filter_list[:-1], filter_list[1:]):
@@ -419,9 +444,12 @@ class Enformer(PreTrainedModel):
         for _ in range(config.depth):
             transformer.append(
                 nn.Sequential(
+                    # MHABlock
                     Residual(
                         nn.Sequential(
                             nn.LayerNorm(config.dim),
+                            # TODO: can this attention be replaced with morden faster attention implementations?
+                            # e.g. flash attention? However, if so, does the pretrained weights still work?
                             Attention(
                                 config.dim,
                                 heads=config.heads,
@@ -435,6 +463,7 @@ class Enformer(PreTrainedModel):
                             nn.Dropout(config.dropout_rate),
                         )
                     ),
+                    # FeedForwardBlock
                     Residual(
                         nn.Sequential(
                             nn.LayerNorm(config.dim),
@@ -471,7 +500,7 @@ class Enformer(PreTrainedModel):
             Rearrange("b n d -> b d n"),
             self.stem,
             self.conv_tower,
-            Rearrange("b d n -> b n d"),
+            Rearrange("b d n -> b n d"),  # Shape after this is (batch, seq_len, dim)
             self.transformer,
             self.crop_final,
             self.final_pointwise,
@@ -514,6 +543,12 @@ class Enformer(PreTrainedModel):
         x = self.stem(x)
         x = self.conv_tower(x)
         x = rearrange(x, "b d n -> b n d")
+        # The torch.nn.utils.checkpoint_sequential function in PyTorch is designed to 
+        # optimize memory usage during the training of deep neural networks by trading 
+        # compute for memory. It achieves this through a technique called "checkpointing," 
+        # which involves saving the intermediate activations of a sequence of layers only 
+        # at specific points, rather than retaining all intermediate activations in memory 
+        # throughout the forward pass.
         x = checkpoint_sequential(self.transformer, len(self.transformer), x)
         x = self.crop_final(x)
         x = self.final_pointwise(x)
@@ -521,18 +556,34 @@ class Enformer(PreTrainedModel):
 
     def forward(
         self,
-        x,
-        target=None,
-        return_corr_coef=False,
-        return_embeddings=False,
-        return_only_embeddings=False,
-        head=None,
-        target_length=None,
-    ):
+        x: Union[list[str], torch.Tensor],
+        target: Optional[torch.Tensor] = None,
+        return_corr_coef: bool = False,
+        return_embeddings: bool = False,
+        return_only_embeddings: bool = False,
+        head: Optional[str] = None,
+        target_length: Optional[int] = None,
+    ) -> Union[torch.Tensor, tuple[dict[str, torch.Tensor], torch.Tensor]]:
+        """
+        Forward pass of the Enformer model.
+
+        Parameters:
+        - x: Input sequence as a list of strings or a tensor of shape (batch_size, sequence_length).
+        - target: Target tensor of shape (batch_size, sequence_length) for calculating loss.
+        - return_corr_coef: Whether to return the correlation coefficient between predictions and targets.
+        - return_embeddings: Whether to return the embeddings along with the predictions.
+        - return_only_embeddings: Whether to return only the embeddings and skip the predictions.
+        - head: Name of the specific output head to use for predictions.
+        - target_length: Length of the target sequence for cropping.
+
+        Returns:
+        - If return_only_embeddings is True, returns the embeddings tensor.
+        - If return_embeddings is True, returns a tuple containing the predictions dictionary and the embeddings tensor.
+        - Otherwise, returns the predictions dictionary.
+        """
         if isinstance(x, list):
             x = str_to_one_hot(x)
-
-        elif type(x) == torch.Tensor and x.dtype == torch.long:
+        elif isinstance(x, torch.Tensor) and x.dtype == torch.long:
             x = seq_indices_to_one_hot(x)
         x.to(self.device)
 
