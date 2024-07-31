@@ -16,7 +16,9 @@ class EnformerConfig(PretrainedConfig):
         pos_dropout = 0.01,
         use_checkpointing = False,
         use_convnext = False,
-        num_downsamples = 7,    # genetic sequence is downsampled 2 ** 7 == 128x in default Enformer - can be changed for higher resolution
+        num_downsamples = 7,    
+        # genetic sequence is downsampled 2 ** 7 == 128x in default Enformer - can be changed for higher resolution
+        # input is 2 ** 17 == 131072 bp
         dim_divisible_by = 128,
         use_tf_gamma = False,
         **kwargs,
