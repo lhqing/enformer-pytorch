@@ -191,6 +191,7 @@ def relative_shift(x):
     return x[..., : ((t2 + 1) // 2)]
 
 
+
 # classes
 
 
@@ -229,7 +230,11 @@ class AttentionPool(nn.Module):
         # close to identiy init
         nn.init.dirac_(self.to_attn_logits.weight)
 
-        # TODO: I'm not sure why this is necessary? Aim to keep the value scale the same after pool?
+        # From paper method:
+        # We initialize w to 2 × 1, where 1 is the identity matrix to prioritize 
+        # the larger value, making the operation similar to max pooling. 
+        # This initialization gave slightly better performance than did random 
+        # initialization or initialization with zeros, representing average pooling
         with torch.no_grad():
             self.to_attn_logits.weight.mul_(2)
 
