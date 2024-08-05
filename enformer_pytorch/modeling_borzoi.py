@@ -289,7 +289,7 @@ class Borzoi(nn.Module):
         # x: (bs, 1536, 16384)
         
         x = self.crop(x.permute(0, 2, 1))
-        # x: (bs, 1536, 16352)
+        # x: (bs, 16352, 1536)
         x = self.final_joined_convs(x.permute(0, 2, 1))
         # x: (bs, 1920, 16352)
 
