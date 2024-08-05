@@ -256,31 +256,48 @@ class Borzoi(nn.Module):
             self.load_state_dict(torch.load(checkpoint_path))
 
     def forward(self, x):
-        x = self.conv_dna(x)
-        x_unet0 = self.res_tower(x)
+        # x: (bs, 4, 524288)
+        x = self.conv_dna(x)  
+        # x: (bs, 512, 262144)
+        x_unet0 = self.res_tower(x)  
+        # x_unet0: (bs, 1280, 16384)
         x_unet1 = self.unet1(x_unet0)
+        # x_unet1: (bs, 1536, 8192)
         x = self._max_pool(x_unet1)
+        # x: (bs, 1536, 4096)
         
         x_unet1 = self.horizontal_conv1(x_unet1)
+        # x_unet1: (bs, 1536, 8192)
         x_unet0 = self.horizontal_conv0(x_unet0)
-        
+        # x_unet0: (bs, 1536, 16384)
+
         x = self.transformer(x.permute(0, 2, 1))
         x = x.permute(0, 2, 1)
+        # x: (bs, 1536, 4096)
         
         x = self.upsampling_unet1(x)
+        # x: (bs, 1536, 8192)
         x += x_unet1
         x = self.separable1(x)
+        # x: (bs, 1536, 8192)
         
         x = self.upsampling_unet0(x)
+        # x: (bs, 1536, 16384)
         x += x_unet0
+        # x: (bs, 1536, 16384)
         x = self.separable0(x)
+        # x: (bs, 1536, 16384)
         
         x = self.crop(x.permute(0, 2, 1))
+        # x: (bs, 1536, 16352)
         x = self.final_joined_convs(x.permute(0, 2, 1))
+        # x: (bs, 1920, 16352)
 
         human_out = self.final_softplus(self.human_head(x))
+        # human_out: (bs, 7611, 16352)
         if self.enable_mouse_head:
             mouse_out = self.final_softplus(self.mouse_head(x))
+            # mouse_out: (bs, 2608, 16352)
             return human_out, mouse_out
         else:
             return human_out
