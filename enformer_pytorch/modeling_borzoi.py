@@ -8,6 +8,7 @@ from torch import nn, einsum
 
 from einops import rearrange
 from .modeling_enformer import relative_shift, Residual, TargetLengthCrop
+from bolero.tl.generic.module_lora_cond import ConditionalLoRALayer
 
 
 def get_positional_features_central_mask(positions, features, seq_len):
@@ -46,8 +47,30 @@ def get_positional_embed(seq_len, feature_size, device):
     return embeddings
 
 
-class Attention(nn.Module):
+def maybe_pass_additional_params(module, x, *args, **kwargs):
+    """Maybe pass additional parameters to the module if it is a subclass of ConditionalLoRALayer."""
+    if isinstance(module, ConditionalLoRALayer):
+        return module(x, *args, **kwargs)
+    else:
+        return module(x)
 
+
+class SequentialwithArgs(nn.Sequential):
+    """Sequential module that can pass additional arguments to the modules."""
+
+    no_args_modules = (nn.MaxPool1d, nn.LayerNorm, nn.Dropout, nn.ReLU, nn.GELU)
+
+    def forward(self, x, *args, **kwargs):
+        for module in self:
+            if isinstance(module, self.no_args_modules):
+                x = module(x)
+            else:
+
+                x = module(x, *args, **kwargs)
+        return x
+
+
+class Attention(nn.Module):
     def __init__(
         self,
         dim=1536,
@@ -88,16 +111,15 @@ class Attention(nn.Module):
         self.rel_pos_bias = nn.Parameter(torch.randn(1, heads, 1, dim_key))
 
         # dropouts
-
         self.pos_dropout = nn.Dropout(pos_dropout)
         self.attn_dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
-        n, h, device = x.shape[-2], self.heads, x.device
+    def forward(self, x, *args, **kwargs):
+        h = self.heads
 
-        q = self.to_q(x)
-        k = self.to_k(x)
-        v = self.to_v(x)
+        q = maybe_pass_additional_params(self.to_q, x, *args, **kwargs)
+        k = maybe_pass_additional_params(self.to_k, x, *args, **kwargs)
+        v = maybe_pass_additional_params(self.to_v, x, *args, **kwargs)
 
         q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q, k, v))
 
@@ -108,7 +130,7 @@ class Attention(nn.Module):
         )
 
         positions = self.pos_dropout(self.positions)
-        rel_k = self.to_rel_k(positions)
+        rel_k = maybe_pass_additional_params(self.to_rel_k, positions)
         rel_k = rearrange(rel_k, "n (h d) -> h n d", h=h)
         rel_logits = einsum("b h i d, h j d -> b h i j", q + self.rel_pos_bias, rel_k)
         rel_logits = relative_shift(rel_logits)
@@ -118,7 +140,7 @@ class Attention(nn.Module):
 
         out = einsum("b h i j, b h j d -> b h i d", attn, v)
         out = rearrange(out, "b h n d -> b n (h d)")
-        out = self.to_out(out)
+        out = maybe_pass_additional_params(self.to_out, out, *args, **kwargs)
         return out
 
 
@@ -130,8 +152,9 @@ class ConvDna(nn.Module):
         )
         self.max_pool = nn.MaxPool1d(kernel_size=2, padding=0)
 
-    def forward(self, x):
-        return self.max_pool(self.conv_layer(x))
+    def forward(self, x, *args, **kwargs):
+        x = maybe_pass_additional_params(self.conv_layer, x, *args, **kwargs)
+        return self.max_pool(x)
 
 
 class ConvBlock(nn.Module):
@@ -159,23 +182,41 @@ class ConvBlock(nn.Module):
                 in_channels, out_channels, kernel_size=kernel_size, padding="same"
             )
 
-    def forward(self, x):
+    def forward(self, x, *args, **kwargs):
         x = self.norm(x)
         x = self.activation(x)
-        x = self.conv_layer(x)
+        if isinstance(self.conv_layer, nn.Sequential):
+            for layer in self.conv_layer:
+                x = maybe_pass_additional_params(layer, x, *args, **kwargs)
+        else:
+            x = maybe_pass_additional_params(self.conv_layer, x, *args, **kwargs)
+        return x
+
+
+class FeedForward(nn.Sequential):
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.2):
+        super().__init__(
+            nn.LayerNorm(input_dim, eps=0.001),
+            nn.Linear(input_dim, hidden_dim),
+            nn.Dropout(dropout),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x, *args, **kwargs):
+        for module in self:
+            x = maybe_pass_additional_params(module, x, *args, **kwargs)
         return x
 
 
 class Borzoi(nn.Module):
 
-    def __init__(self, checkpoint_path=None, enable_mouse_head=False):
-        # TODO support RC and augs, add gradient functions, and much more
-        # TODO rename layers to be understandable if I am feeling like adapting the state dict at some point
+    def __init__(self, checkpoint_path=None):
         super(Borzoi, self).__init__()
-        self.enable_mouse_head = enable_mouse_head
         self.conv_dna = ConvDna()
         self._max_pool = nn.MaxPool1d(kernel_size=2, padding=0)
-        self.res_tower = nn.Sequential(
+        self.res_tower = SequentialwithArgs(
             ConvBlock(in_channels=512, out_channels=608, kernel_size=5),
             self._max_pool,
             ConvBlock(in_channels=608, out_channels=736, kernel_size=5),
@@ -186,16 +227,16 @@ class Borzoi(nn.Module):
             self._max_pool,
             ConvBlock(in_channels=1056, out_channels=1280, kernel_size=5),
         )
-        self.unet1 = nn.Sequential(
+        self.unet1 = SequentialwithArgs(
             self._max_pool,
             ConvBlock(in_channels=1280, out_channels=1536, kernel_size=5),
         )
         transformer = []
         for _ in range(8):
             transformer.append(
-                nn.Sequential(
+                SequentialwithArgs(
                     Residual(
-                        nn.Sequential(
+                        SequentialwithArgs(
                             nn.LayerNorm(1536, eps=0.001),
                             Attention(
                                 1536,
@@ -210,88 +251,108 @@ class Borzoi(nn.Module):
                         )
                     ),
                     Residual(
-                        nn.Sequential(
-                            nn.LayerNorm(1536, eps=0.001),
-                            nn.Linear(1536, 1536 * 2),
-                            nn.Dropout(0.2),
-                            nn.ReLU(),
-                            nn.Linear(1536 * 2, 1536),
-                            nn.Dropout(0.2),
-                        )
+                        FeedForward(
+                            input_dim=1536,
+                            hidden_dim=1536 * 2,
+                            output_dim=1536,
+                            dropout=0.2,
+                        ),
                     ),
                 )
             )
-        self.horizontal_conv0, self.horizontal_conv1 = ConvBlock(
+        self.horizontal_conv0 = ConvBlock(
             in_channels=1280, out_channels=1536, kernel_size=1
-        ), ConvBlock(in_channels=1536, out_channels=1536, kernel_size=1)
+        )
+        self.horizontal_conv1 = ConvBlock(
+            in_channels=1536, out_channels=1536, kernel_size=1
+        )
+
         self.upsample = torch.nn.Upsample(scale_factor=2)
-        self.transformer = nn.Sequential(*transformer)
-        self.upsampling_unet1 = nn.Sequential(
+        self.transformer = SequentialwithArgs(*transformer)
+
+        self.upsampling_unet1 = SequentialwithArgs(
             ConvBlock(in_channels=1536, out_channels=1536, kernel_size=1),
             self.upsample,
         )
         self.separable1 = ConvBlock(
             in_channels=1536, out_channels=1536, kernel_size=3, conv_type="separable"
         )
-        self.upsampling_unet0 = nn.Sequential(
+
+        self.upsampling_unet0 = SequentialwithArgs(
             ConvBlock(in_channels=1536, out_channels=1536, kernel_size=1),
             self.upsample,
         )
         self.separable0 = ConvBlock(
             in_channels=1536, out_channels=1536, kernel_size=3, conv_type="separable"
         )
+
         self.crop = TargetLengthCrop(16384 - 32)
-        self.final_joined_convs = nn.Sequential(
+        self.final_joined_convs = SequentialwithArgs(
             ConvBlock(in_channels=1536, out_channels=1920, kernel_size=1),
             nn.Dropout(0.1),
             nn.GELU(approximate="tanh"),
         )
+
+        if checkpoint_path is not None:
+            self.load_state_dict(torch.load(checkpoint_path))
+
+    def forward(self, x, *args, **kwargs):
+        # x: (bs, 4, 524288)
+        x = self.conv_dna(x, *args, **kwargs)
+        # x: (bs, 512, 262144)
+        x_unet0 = self.res_tower(x, *args, **kwargs)
+        # x_unet0: (bs, 1280, 16384)
+        x_unet1 = self.unet1(x_unet0, *args, **kwargs)
+        # x_unet1: (bs, 1536, 8192)
+        x = self._max_pool(x_unet1)
+        # x: (bs, 1536, 4096)
+
+        x_unet1 = self.horizontal_conv1(x_unet1, *args, **kwargs)
+        # x_unet1: (bs, 1536, 8192)
+        x_unet0 = self.horizontal_conv0(x_unet0, *args, **kwargs)
+        # x_unet0: (bs, 1536, 16384)
+
+        x = self.transformer(x.permute(0, 2, 1), *args, **kwargs)
+        x = x.permute(0, 2, 1)
+        # x: (bs, 1536, 4096)
+
+        x = self.upsampling_unet1(x, *args, **kwargs)
+        # x: (bs, 1536, 8192)
+        x += x_unet1
+        x = self.separable1(x, *args, **kwargs)
+        # x: (bs, 1536, 8192)
+
+        x = self.upsampling_unet0(x, *args, **kwargs)
+        # x: (bs, 1536, 16384)
+        x += x_unet0
+        # x: (bs, 1536, 16384)
+        x = self.separable0(x, *args, **kwargs)
+        # x: (bs, 1536, 16384)
+
+        x = self.crop(x.permute(0, 2, 1))
+        # x: (bs, 16352, 1536)
+        x = self.final_joined_convs(x.permute(0, 2, 1), *args, **kwargs)
+        # x: (bs, 1920, 16352)
+
+
+class BorzoiWithOutputHead(Borzoi):
+    def __init__(self, checkpoint_path=None, enable_mouse_head=True):
+        super().__init__(checkpoint_path=None)
+
         self.human_head = nn.Conv1d(in_channels=1920, out_channels=7611, kernel_size=1)
+
+        self.enable_mouse_head = enable_mouse_head
         if self.enable_mouse_head:
             self.mouse_head = nn.Conv1d(
                 in_channels=1920, out_channels=2608, kernel_size=1
             )
         self.final_softplus = nn.Softplus()
+
         if checkpoint_path is not None:
             self.load_state_dict(torch.load(checkpoint_path))
 
-    def forward(self, x):
-        # x: (bs, 4, 524288)
-        x = self.conv_dna(x)  
-        # x: (bs, 512, 262144)
-        x_unet0 = self.res_tower(x)  
-        # x_unet0: (bs, 1280, 16384)
-        x_unet1 = self.unet1(x_unet0)
-        # x_unet1: (bs, 1536, 8192)
-        x = self._max_pool(x_unet1)
-        # x: (bs, 1536, 4096)
-        
-        x_unet1 = self.horizontal_conv1(x_unet1)
-        # x_unet1: (bs, 1536, 8192)
-        x_unet0 = self.horizontal_conv0(x_unet0)
-        # x_unet0: (bs, 1536, 16384)
-
-        x = self.transformer(x.permute(0, 2, 1))
-        x = x.permute(0, 2, 1)
-        # x: (bs, 1536, 4096)
-        
-        x = self.upsampling_unet1(x)
-        # x: (bs, 1536, 8192)
-        x += x_unet1
-        x = self.separable1(x)
-        # x: (bs, 1536, 8192)
-        
-        x = self.upsampling_unet0(x)
-        # x: (bs, 1536, 16384)
-        x += x_unet0
-        # x: (bs, 1536, 16384)
-        x = self.separable0(x)
-        # x: (bs, 1536, 16384)
-        
-        x = self.crop(x.permute(0, 2, 1))
-        # x: (bs, 16352, 1536)
-        x = self.final_joined_convs(x.permute(0, 2, 1))
-        # x: (bs, 1920, 16352)
+    def forward(self, x, *args, **kwargs):
+        x = super().forward(x, *args, **kwargs)
 
         human_out = self.final_softplus(self.human_head(x))
         # human_out: (bs, 7611, 16352)

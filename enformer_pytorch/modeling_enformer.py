@@ -200,8 +200,8 @@ class Residual(nn.Module):
         super().__init__()
         self.fn = fn
 
-    def forward(self, x, **kwargs):
-        return self.fn(x, **kwargs) + x
+    def forward(self, x, *args, **kwargs):
+        return self.fn(x, *args, **kwargs) + x
 
 
 class GELU(nn.Module):
